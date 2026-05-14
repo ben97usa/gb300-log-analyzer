@@ -406,7 +406,7 @@ if rows:
         colors = {"critical":"background-color:#3d1515;color:#ef4444","warning":"background-color:#3d2a10;color:#f59e0b","low":"background-color:#2a2d10;color:#eab308","info":"background-color:#0f1729;color:#64748b"}
         return colors.get(val, "")
 
-    styled = df.style.applymap(color_severity, subset=["Severity"])
+    styled = df.style.map(color_severity, subset=["Severity"])
     st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
 
     # ─── Download ────────────────────────────────────────────────────────────
