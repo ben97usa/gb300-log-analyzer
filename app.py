@@ -3,8 +3,9 @@ import json
 import zipfile
 import re
 import io
-import tempfile
 import os
+import base64
+import requests
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -19,22 +20,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── CSS ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;500;600&display=swap');
-
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-.main { background: #0a0e1a; }
-.block-container { padding: 2rem 3rem; max-width: 1400px; }
-
 .title-block {
     background: linear-gradient(135deg, #0f1729 0%, #1a2440 100%);
     border: 1px solid #2a3a5c;
     border-radius: 12px;
     padding: 2rem 2.5rem;
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
     position: relative;
     overflow: hidden;
 }
@@ -45,72 +40,54 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     height: 3px;
     background: linear-gradient(90deg, #3b82f6, #06b6d4, #3b82f6);
 }
-.title-block h1 {
-    font-family: 'JetBrains Mono', monospace;
-    color: #e2e8f0;
-    font-size: 1.8rem;
-    margin: 0 0 0.3rem 0;
-    letter-spacing: -0.5px;
-}
+.title-block h1 { font-family: 'JetBrains Mono', monospace; color: #e2e8f0; font-size: 1.8rem; margin: 0 0 0.3rem 0; }
 .title-block p { color: #64748b; margin: 0; font-size: 0.9rem; }
-
-.metric-card {
-    background: #0f1729;
-    border: 1px solid #1e2d47;
-    border-radius: 10px;
-    padding: 1.2rem 1.5rem;
-    text-align: center;
-}
-.metric-card .value {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 2.2rem;
-    font-weight: 700;
-    line-height: 1;
-    margin-bottom: 0.4rem;
-}
+.metric-card { background: #0f1729; border: 1px solid #1e2d47; border-radius: 10px; padding: 1.2rem 1.5rem; text-align: center; }
+.metric-card .value { font-family: 'JetBrains Mono', monospace; font-size: 2.2rem; font-weight: 700; line-height: 1; margin-bottom: 0.4rem; }
 .metric-card .label { color: #64748b; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; }
-
 .critical .value { color: #ef4444; }
 .warning  .value { color: #f59e0b; }
 .info     .value { color: #3b82f6; }
 .success  .value { color: #10b981; }
-
-.upload-zone {
-    background: #0f1729;
-    border: 2px dashed #2a3a5c;
-    border-radius: 12px;
-    padding: 2rem;
-    text-align: center;
-    margin-bottom: 1.5rem;
-    transition: border-color 0.2s;
-}
-.upload-zone:hover { border-color: #3b82f6; }
-
-.sn-badge {
-    display: inline-block;
-    background: #1e2d47;
-    color: #94a3b8;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.72rem;
-    padding: 2px 8px;
-    border-radius: 4px;
-    margin: 2px;
-}
-
-.fault-critical { color: #ef4444; font-weight: 600; }
-.fault-warning  { color: #f59e0b; font-weight: 600; }
-.fault-low      { color: #3b82f6; }
-
-stDataFrame { font-family: 'JetBrains Mono', monospace !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Parser logic ────────────────────────────────────────────────────────────
-FAULT_DESCRIPTIONS = {
-    "62660": "GPU missing from nvidia-smi",
-    "67802": "Server Chassis Fault",
-}
+# ─── GitHub Storage ───────────────────────────────────────────────────────────
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
+DATA_FILE    = "data/gb300_data.json"
 
+def gh_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+
+def load_from_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return []
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DATA_FILE}"
+    r = requests.get(url, headers=gh_headers())
+    if r.status_code == 200:
+        content = base64.b64decode(r.json()["content"]).decode("utf-8")
+        return json.loads(content)
+    return []
+
+def save_to_github(data):
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DATA_FILE}"
+    # Get current SHA if file exists
+    r = requests.get(url, headers=gh_headers())
+    sha = r.json().get("sha") if r.status_code == 200 else None
+    content = base64.b64encode(json.dumps(data, ensure_ascii=False, indent=2).encode()).decode()
+    payload = {
+        "message": f"Update GB300 data — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "content": content,
+    }
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=gh_headers(), json=payload)
+    return r.status_code in (200, 201)
+
+# ─── Parser ───────────────────────────────────────────────────────────────────
 def parse_folder_name(folder_name):
     info = {}
     wal_match = re.search(r"(WAL_[^\-\(\)/\\]+)", folder_name)
@@ -145,7 +122,6 @@ def classify_fault(diag):
     component = diag.get("ComponentType", "Unknown")
     source = diag.get("SourceOfFault", "")
     fault_code = str(diag.get("FaultCode", ""))
-    action = diag.get("Action", "Unknown")
 
     is_ps_fault = "PS RUN PWR FAULT" in reason
     if is_ps_fault:
@@ -159,8 +135,8 @@ def classify_fault(diag):
         subclass2 = str(pf.get("Subclass2", ""))
         gf = parse_gpu_faults(summary)
         gpu_faults.extend(gf)
-        if not gf and subclass2 in FAULT_DESCRIPTIONS:
-            errors.append(FAULT_DESCRIPTIONS[subclass2])
+        if not gf and subclass2 == "62660":
+            errors.append("GPU missing from nvidia-smi")
 
     for gf in gpu_faults:
         errors.append(f"GPU BDF {gf['bdf']} missing — {gf['board']} Board")
@@ -168,7 +144,6 @@ def classify_fault(diag):
     if not errors:
         errors.append(reason or f"FaultCode {fault_code}")
 
-    # Fix action
     if is_ps_fault:
         fix = "Replace Power Supply (PS)"
     elif gpu_faults:
@@ -183,84 +158,93 @@ def classify_fault(diag):
 
     return errors, fix, component, source, gpu_faults, severity
 
+def parse_description_content(content, sn, folder_info):
+    content = content.strip()
+    if not content.startswith("{"):
+        return None
+    try:
+        diag = json.loads(content)
+    except Exception:
+        return None
+    errors, fix, component, source, gpu_faults, severity = classify_fault(diag)
+    part = diag.get("PartFailures", [{}])[0]
+    return {
+        "SN":            sn,
+        "Ticket":        folder_info.get("Ticket", ""),
+        "Wal":           folder_info.get("Wal", ""),
+        "Model":         part.get("ModelNumber", ""),
+        "Location":      part.get("Location", ""),
+        "FaultCode":     str(diag.get("FaultCode", "")),
+        "Source":        source,
+        "Timestamp":     part.get("DateandTimestamp", ""),
+        "GPU_Total":     len(gpu_faults),
+        "GPU_Primary":   sum(1 for g in gpu_faults if g["board"] == "Primary"),
+        "GPU_Secondary": sum(1 for g in gpu_faults if g["board"] == "Secondary"),
+        "Errors":        "\n".join(errors),
+        "Action":        fix,
+        "Component":     component,
+        "Severity":      severity,
+        "UploadedAt":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
 def process_zip(zip_bytes):
     rows = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        names = z.namelist()
-        for name in names:
+        for name in z.namelist():
             parts = Path(name).parts
-            if len(parts) < 3:
+            if len(parts) < 3 or name.endswith("/"):
                 continue
-            sn = parts[0]
-            folder = parts[1]
-            filename = parts[-1]
-
-            if len(parts) < 3 or parts[-1] == "":
-                continue
+            sn, folder, filename = parts[0], parts[1], parts[-1]
             if "description" not in filename.lower() and not filename.endswith(".json"):
-                # try to read anyway if it looks like a file (not dir)
-                if not filename or filename.endswith("/"):
-                    continue
-
+                continue
             try:
-                content = z.read(name).decode("utf-8", errors="ignore").strip()
-                if not content.startswith("{"):
-                    continue
-                diag = json.loads(content)
+                content = z.read(name).decode("utf-8", errors="ignore")
+                folder_info = parse_folder_name(folder)
+                row = parse_description_content(content, sn, folder_info)
+                if row:
+                    rows.append(row)
             except Exception:
                 continue
+    return rows
 
-            folder_info = parse_folder_name(folder)
-            errors, fix, component, source, gpu_faults, severity = classify_fault(diag)
-
-            part = diag.get("PartFailures", [{}])[0]
-            timestamp = part.get("DateandTimestamp", "")
-            model = part.get("ModelNumber", "")
-            location = part.get("Location", "")
-
-            primary_count   = sum(1 for g in gpu_faults if g["board"] == "Primary")
-            secondary_count = sum(1 for g in gpu_faults if g["board"] == "Secondary")
-
-            rows.append({
-                "SN":              sn,
-                "Ticket":          folder_info.get("Ticket", ""),
-                "Wal":             folder_info.get("Wal", ""),
-                "Model":           model,
-                "Location":        location,
-                "FaultCode":       str(diag.get("FaultCode", "")),
-                "Source":          source,
-                "Timestamp":       timestamp,
-                "GPU_Total":       len(gpu_faults),
-                "GPU_Primary":     primary_count,
-                "GPU_Secondary":   secondary_count,
-                "Errors":          "\n".join(errors),
-                "Action":          fix,
-                "Component":       component,
-                "Severity":        severity,
-                "RawReason":       diag.get("Reason", ""),
-            })
+def process_description_files(files):
+    """Process individually uploaded description files."""
+    rows = []
+    for f in files:
+        try:
+            content = f.read().decode("utf-8", errors="ignore")
+            # Try to extract SN from filename or content
+            row = parse_description_content(content, f.name, {})
+            if row:
+                # Try get SN from JSON
+                try:
+                    diag = json.loads(content.strip())
+                    pf = diag.get("PartFailures", [{}])[0]
+                    sn = pf.get("SerialNumber", f.name)
+                    row["SN"] = sn
+                except Exception:
+                    pass
+                rows.append(row)
+        except Exception:
+            continue
     return rows
 
 def build_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = "GB300 Analysis"
+    header_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    header_fill = PatternFill("solid", start_color="1F3864")
+    cell_font   = Font(name="Arial", size=9)
+    center      = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    left        = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+    thin        = Side(style="thin", color="CCCCCC")
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fills       = {"critical": "FFCCCC", "warning": "FFE5CC", "low": "FFFACC", "info": "FFFFFF"}
 
-    header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    header_fill  = PatternFill("solid", start_color="1F3864")
-    cell_font    = Font(name="Arial", size=9)
-    center       = Alignment(horizontal="center", vertical="top", wrap_text=True)
-    left         = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-    thin         = Side(style="thin", color="CCCCCC")
-    border       = Border(left=thin, right=thin, top=thin, bottom=thin)
-    fill_red     = PatternFill("solid", start_color="FFCCCC")
-    fill_orange  = PatternFill("solid", start_color="FFE5CC")
-    fill_yellow  = PatternFill("solid", start_color="FFFACC")
-    fill_white   = PatternFill("solid", start_color="FFFFFF")
-
-    headers   = ["SN","Ticket","Wal","Model","Location","Fault Code","Source","Timestamp","GPUs Missing","Primary","Secondary","Errors","Action Required","Component"]
-    col_keys  = ["SN","Ticket","Wal","Model","Location","FaultCode","Source","Timestamp","GPU_Total","GPU_Primary","GPU_Secondary","Errors","Action","Component"]
-    col_widths= [22,14,18,14,10,10,12,20,12,10,11,55,40,18]
+    headers   = ["SN","Ticket","Wal","Model","Location","Fault Code","Source","Timestamp","GPUs Missing","Primary","Secondary","Errors","Action Required","Component","Uploaded At"]
+    col_keys  = ["SN","Ticket","Wal","Model","Location","FaultCode","Source","Timestamp","GPU_Total","GPU_Primary","GPU_Secondary","Errors","Action","Component","UploadedAt"]
+    col_widths= [22,14,18,14,10,10,12,20,12,10,11,55,40,18,18]
 
     for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=1, column=ci, value=h)
@@ -271,36 +255,29 @@ def build_excel(rows):
     ws.freeze_panes = "A2"
 
     for ri, row in enumerate(rows, 2):
-        sev = row["Severity"]
-        rf = fill_red if sev == "critical" else fill_orange if sev == "warning" else fill_yellow if sev == "low" else fill_white
+        rf = PatternFill("solid", start_color=fills.get(row["Severity"], "FFFFFF"))
         for ci, key in enumerate(col_keys, 1):
             cell = ws.cell(row=ri, column=ci, value=row.get(key, ""))
             cell.font = cell_font; cell.fill = rf; cell.border = border
             cell.alignment = center if key in ("SN","FaultCode","GPU_Total","GPU_Primary","GPU_Secondary","Location") else left
-        lines = row["Errors"].count("\n") + 1
-        ws.row_dimensions[ri].height = max(18, 14 * lines)
+        ws.row_dimensions[ri].height = max(18, 14 * (row["Errors"].count("\n") + 1))
 
-    # Summary sheet
     ws2 = wb.create_sheet("Summary")
-    ws2["A1"] = "GB300 Log Analysis Summary"
+    ws2["A1"] = "GB300 Analysis Summary"
     ws2["A1"].font = Font(name="Arial", bold=True, size=14, color="1F3864")
     ws2["B1"] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     ws2["B1"].font = Font(name="Arial", size=10, color="888888")
-
-    summary = [
-        ("Total Servers Analyzed",        len(rows)),
-        ("🔴 Critical (4+ GPU / PS fault)", sum(1 for r in rows if r["Severity"] == "critical")),
-        ("🟠 Warning (2-3 GPU missing)",   sum(1 for r in rows if r["Severity"] == "warning")),
-        ("🟡 Low (1 GPU missing)",         sum(1 for r in rows if r["Severity"] == "low")),
-        ("PS RUN PWR FAULT",              sum(1 for r in rows if "PS RUN PWR FAULT" in r["Errors"])),
-        ("Total GPUs Missing",            sum(r["GPU_Total"] for r in rows)),
-        ("Primary Board GPU Missing",     sum(r["GPU_Primary"] for r in rows)),
-        ("Secondary Board GPU Missing",   sum(r["GPU_Secondary"] for r in rows)),
-    ]
-    for i, (label, val) in enumerate(summary, 3):
+    for i, (label, val) in enumerate([
+        ("Total Servers", len(rows)),
+        ("Critical (4+ GPU / PS fault)", sum(1 for r in rows if r["Severity"] == "critical")),
+        ("Warning (2-3 GPU)", sum(1 for r in rows if r["Severity"] == "warning")),
+        ("Low (1 GPU)", sum(1 for r in rows if r["Severity"] == "low")),
+        ("PS RUN PWR FAULT", sum(1 for r in rows if "PS RUN PWR FAULT" in r["Errors"])),
+        ("Total GPUs Missing", sum(r["GPU_Total"] for r in rows)),
+    ], 3):
         ws2.cell(row=i, column=1, value=label).font = Font(name="Arial", bold=True, size=11)
         ws2.cell(row=i, column=2, value=val).font   = Font(name="Arial", size=11)
-    ws2.column_dimensions["A"].width = 38
+    ws2.column_dimensions["A"].width = 35
     ws2.column_dimensions["B"].width = 15
 
     buf = io.BytesIO()
@@ -310,50 +287,66 @@ def build_excel(rows):
 
 # ─── Session state ────────────────────────────────────────────────────────────
 if "all_rows" not in st.session_state:
-    st.session_state.all_rows = []
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = set()
+    with st.spinner("Loading data from GitHub..."):
+        st.session_state.all_rows = load_from_github()
+if "delete_mode" not in st.session_state:
+    st.session_state.delete_mode = False
 
 # ─── Header ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="title-block">
   <h1>🖥️ GB300 Log Analyzer</h1>
-  <p>Quanta Azure GPU Compute · B200 · CSI Diagnostic Parser</p>
+  <p>Quanta Azure GPU Compute · B200 · CSI Diagnostic Parser — Data saved permanently</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ─── Upload ───────────────────────────────────────────────────────────────────
-col_up, col_clear = st.columns([5, 1])
-with col_up:
-    uploaded = st.file_uploader(
-        "Upload GB300Logs.zip (có thể upload nhiều lần để append data)",
-        type=["zip"],
-        accept_multiple_files=True,
-        label_visibility="visible",
-    )
-with col_clear:
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🗑️ Clear All", use_container_width=True):
-        st.session_state.all_rows = []
-        st.session_state.uploaded_files = set()
-        st.rerun()
+# ─── Search bar (prominent, always visible) ───────────────────────────────────
+search = st.text_input("🔍 Search by SN, Ticket, Wal, or Error", placeholder="e.g. P87815452... or PS RUN or 62660", label_visibility="visible")
 
-# Process new uploads
-if uploaded:
-    new_count = 0
-    for f in uploaded:
-        file_key = f"{f.name}_{f.size}"
-        if file_key not in st.session_state.uploaded_files:
-            with st.spinner(f"Processing {f.name}..."):
-                new_rows = process_zip(f.read())
-                # Avoid duplicate SNs
+st.markdown("---")
+
+# ─── Upload section ───────────────────────────────────────────────────────────
+with st.expander("📂 Upload New Logs", expanded=not bool(st.session_state.all_rows)):
+    tab1, tab2 = st.tabs(["📦 Upload ZIP (nhiều SN)", "📄 Upload Description file (1 SN)"])
+
+    with tab1:
+        uploaded_zip = st.file_uploader("Chọn GB300Logs.zip", type=["zip"], accept_multiple_files=True, key="zip_uploader")
+        if uploaded_zip:
+            if st.button("➕ Process & Save ZIP", type="primary"):
+                new_rows = []
+                for f in uploaded_zip:
+                    with st.spinner(f"Processing {f.name}..."):
+                        new_rows.extend(process_zip(f.read()))
                 existing_sns = {r["SN"] for r in st.session_state.all_rows}
                 added = [r for r in new_rows if r["SN"] not in existing_sns]
-                st.session_state.all_rows.extend(added)
-                st.session_state.uploaded_files.add(file_key)
-                new_count += len(added)
-    if new_count > 0:
-        st.success(f"✅ Added {new_count} new servers")
+                if added:
+                    st.session_state.all_rows.extend(added)
+                    with st.spinner("Saving to GitHub..."):
+                        ok = save_to_github(st.session_state.all_rows)
+                    if ok:
+                        st.success(f"✅ Added {len(added)} new servers — saved permanently!")
+                    else:
+                        st.warning(f"✅ Added {len(added)} servers (session only — GitHub save failed)")
+                else:
+                    st.info("No new SNs found (already in database)")
+
+    with tab2:
+        uploaded_files = st.file_uploader("Chọn Description file(s)", accept_multiple_files=True, key="file_uploader")
+        if uploaded_files:
+            if st.button("➕ Process & Save Files", type="primary"):
+                new_rows = process_description_files(uploaded_files)
+                existing_sns = {r["SN"] for r in st.session_state.all_rows}
+                added = [r for r in new_rows if r["SN"] not in existing_sns]
+                if added:
+                    st.session_state.all_rows.extend(added)
+                    with st.spinner("Saving to GitHub..."):
+                        ok = save_to_github(st.session_state.all_rows)
+                    if ok:
+                        st.success(f"✅ Added {len(added)} new servers — saved permanently!")
+                    else:
+                        st.warning(f"✅ Added (session only — GitHub save failed)")
+                else:
+                    st.info("No new SNs found")
 
 rows = st.session_state.all_rows
 
@@ -380,54 +373,93 @@ if rows:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ─── Filters ─────────────────────────────────────────────────────────────
-    with st.expander("🔍 Filters", expanded=False):
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            sev_filter = st.multiselect("Severity", ["critical","warning","low","info"], default=["critical","warning","low","info"])
-        with fc2:
-            source_filter = st.multiselect("Source", list(set(r["Source"] for r in rows)), default=list(set(r["Source"] for r in rows)))
-        with fc3:
-            search = st.text_input("Search SN / Ticket / Error", "")
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        sev_filter = st.multiselect("Severity", ["critical","warning","low","info"],
+                                     default=["critical","warning","low","info"])
+    with fc2:
+        sources = list(set(r["Source"] for r in rows))
+        source_filter = st.multiselect("Source", sources, default=sources)
 
+    # Apply filters + search
     filtered = [
         r for r in rows
         if r["Severity"] in sev_filter
         and r["Source"] in source_filter
-        and (not search or search.lower() in r["SN"].lower() or search.lower() in r["Ticket"].lower() or search.lower() in r["Errors"].lower())
+        and (not search or any(
+            search.lower() in str(r.get(k, "")).lower()
+            for k in ["SN","Ticket","Wal","Errors","Action","Model"]
+        ))
     ]
 
-    # ─── Table ───────────────────────────────────────────────────────────────
-    st.markdown(f"### Results — {len(filtered)} servers")
+    # ─── Table + Delete ──────────────────────────────────────────────────────
+    col_title, col_del_btn = st.columns([4, 1])
+    with col_title:
+        st.markdown(f"### Results — {len(filtered)} servers")
+    with col_del_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🗑️ Delete Mode" if not st.session_state.delete_mode else "✅ Exit Delete", use_container_width=True):
+            st.session_state.delete_mode = not st.session_state.delete_mode
+            st.rerun()
 
-    df = pd.DataFrame(filtered)[["SN","Ticket","Wal","Model","FaultCode","Source","Timestamp","GPU_Total","GPU_Primary","GPU_Secondary","Errors","Action","Severity"]]
-    df.columns = ["SN","Ticket","Wal","Model","Fault Code","Source","Timestamp","GPUs Missing","Primary","Secondary","Errors","Action Required","Severity"]
+    if st.session_state.delete_mode:
+        st.warning("⚠️ Delete mode ON — chọn SN muốn xóa bên dưới")
+        sns_to_delete = []
+        cols = st.columns(4)
+        for i, r in enumerate(filtered):
+            with cols[i % 4]:
+                if st.checkbox(f"{r['SN']}", key=f"del_{r['SN']}"):
+                    sns_to_delete.append(r["SN"])
 
-    def color_severity(val):
-        colors = {"critical":"background-color:#3d1515;color:#ef4444","warning":"background-color:#3d2a10;color:#f59e0b","low":"background-color:#2a2d10;color:#eab308","info":"background-color:#0f1729;color:#64748b"}
-        return colors.get(val, "")
+        if sns_to_delete:
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.error(f"Sẽ xóa {len(sns_to_delete)} SN: {', '.join(sns_to_delete)}")
+            with dc2:
+                if st.button("🗑️ Confirm Delete", type="primary", use_container_width=True):
+                    st.session_state.all_rows = [r for r in st.session_state.all_rows if r["SN"] not in sns_to_delete]
+                    with st.spinner("Saving..."):
+                        save_to_github(st.session_state.all_rows)
+                    st.session_state.delete_mode = False
+                    st.success(f"✅ Deleted {len(sns_to_delete)} servers")
+                    st.rerun()
+    else:
+        # Normal table view
+        df = pd.DataFrame(filtered)[["SN","Ticket","Wal","Model","FaultCode","Source","Timestamp","GPU_Total","GPU_Primary","GPU_Secondary","Errors","Action","Severity","UploadedAt"]]
+        df.columns = ["SN","Ticket","Wal","Model","Fault Code","Source","Timestamp","GPUs Missing","Primary","Secondary","Errors","Action Required","Severity","Uploaded At"]
 
-    styled = df.style.map(color_severity, subset=["Severity"])
-    st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
+        def color_severity(val):
+            colors = {
+                "critical": "background-color:#3d1515;color:#ef4444",
+                "warning":  "background-color:#3d2a10;color:#f59e0b",
+                "low":      "background-color:#2a2d10;color:#eab308",
+                "info":     "background-color:#0f1729;color:#64748b"
+            }
+            return colors.get(val, "")
+
+        styled = df.style.map(color_severity, subset=["Severity"])
+        st.dataframe(styled, use_container_width=True, height=500, hide_index=True)
 
     # ─── Download ────────────────────────────────────────────────────────────
     st.markdown("---")
     dl1, dl2 = st.columns(2)
+    fname = f"GB300_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}"
     with dl1:
         excel_bytes = build_excel(filtered)
-        fname = f"GB300_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        st.download_button("⬇️ Download Excel", data=excel_bytes, file_name=fname,
+        st.download_button("⬇️ Download Excel", data=excel_bytes,
+                           file_name=f"{fname}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True)
     with dl2:
-        csv = df.to_csv(index=False).encode("utf-8")
+        csv = df.to_csv(index=False).encode("utf-8") if not st.session_state.delete_mode else pd.DataFrame(filtered).to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download CSV", data=csv,
-                           file_name=f"GB300_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                           file_name=f"{fname}.csv",
                            mime="text/csv", use_container_width=True)
+
 else:
     st.markdown("""
     <div style="text-align:center;padding:4rem;color:#334155;">
         <div style="font-size:3rem;margin-bottom:1rem">📂</div>
-        <div style="font-family:'JetBrains Mono',monospace;font-size:1rem">Upload GB300Logs.zip to begin</div>
-        <div style="font-size:0.8rem;margin-top:0.5rem;color:#1e2d47">Supports multiple uploads — data will be appended automatically</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:1rem">No data yet — upload GB300Logs.zip to begin</div>
     </div>
     """, unsafe_allow_html=True)
